@@ -102,18 +102,25 @@ class IOCTLRequest:
 
         def fn(fd, *args, data=b''):
             if isinstance(fmt, str):
-                buf = struct.pack(fmt, *args)
-                buf += data
+                if fmt=="@I" and len(args)==1:
+                    buf = args[0]
+                else:
+                    buf = struct.pack(fmt, *args)
+                    buf += data
             else:
                 buf = data + bytes(fmt - len(data))
 
             req = IOCTLRequest.IOC(dir, _type, nr, fmt)
-            print(nr, ':', req, ':', len(buf), buf)
-            buf = bytearray(buf)
-            if len(buf) == 0:
-                buf = 0
+            if not isinstance(buf,int):
+                # print(nr, ':', req, ':', len(buf), buf)
+                buf = bytearray(buf)
+                if len(buf) == 0:
+                    buf = 0
+            else:
+                # print(nr, ':', req, ':', buf)
+                pass
             resp = fcntl.ioctl(fd, req, buf, True)
-            print(f"{resp=} {buf=}")
+            # print(f"{resp=} {buf=}")
             return resp, buf
 
         return fn
@@ -137,6 +144,9 @@ class RawGadgetRequests(IOCTLRequest):
     USB_RAW_IOCTL_EP_SET_HALT = IOCTLRequest.ioc('W', 'U', 13, "@I")
     USB_RAW_IOCTL_EP_CLEAR_HALT = IOCTLRequest.ioc('W', 'U', 14, "@I")
     USB_RAW_IOCTL_EP_SET_WEDGE = IOCTLRequest.ioc('W', 'U', 15, "@I")
+    USB_RAW_IOCTL_EP_FIFO_STATUS = IOCTLRequest.ioc('W', 'U', 16, "@I")
+    USB_RAW_IOCTL_EP_WRITE_ASYNC = IOCTLRequest.ioc('W', 'U', 17, "@HHI0B")
+    USB_RAW_IOCTL_EP_READ_ASYNC = IOCTLRequest.ioc('WR', 'U', 18, "@HHI0B")
 
 
 class UsbDeviceSpeed(IntEnum):
@@ -224,6 +234,9 @@ class RawGadget:
     def ep_read(self, ep, data, flags=0):
         return RawGadgetRequests.USB_RAW_IOCTL_EP_READ(self.fd, ep, flags, len(data), data=data)
 
+    def ep_read_async(self, ep, data, flags=0):
+        return RawGadgetRequests.USB_RAW_IOCTL_EP_READ_ASYNC(self.fd, ep, flags, len(data), data=data)
+
     def __aexit__(self, exc_type, exc_val, exc_tb):
         self.close()
 
@@ -233,6 +246,9 @@ class RawGadget:
     def ep_stall(self, num):
         if num==0:
             RawGadgetRequests.USB_RAW_IOCTL_EP0_STALL(self.fd)
+
+    def fifo_status(self, num):
+        RawGadgetRequests.USB_RAW_IOCTL_EP_FIFO_STATUS(self.fd, num)
 
 
 
@@ -271,7 +287,7 @@ class RawGadgetApp(FacedancerApp):
         self.connected_device: typing.Optional[USBBaseDevice] = None
 
         if 'RG_SPEED' in os.environ:
-            self.speed = os.environ['RG_SPEED'].lower()
+            self.speed = UsbDeviceSpeed(int(os.environ['RG_SPEED']))
         else:
             self.speed = UsbDeviceSpeed.USB_SPEED_HIGH
 
@@ -290,6 +306,7 @@ class RawGadgetApp(FacedancerApp):
         logging.info(f"__init__({device=},{verbose=},{quirks=})")
         self.fd = open('/dev/raw-gadget')
         self.is_configured=False
+        self.endpoint_recv_buffer = {}
         super().__init__(device, verbose)
 
     def init_commands(self):
@@ -304,13 +321,14 @@ class RawGadgetApp(FacedancerApp):
         self.api.close()
 
     def configured(self,configuration):
-        print(f"configured {configuration=}")
+        # print(f"configured {configuration=}")
         cfg: typing.Optional[USBConfiguration] = self.connected_device.configuration
         if cfg is None:
             for ep in self.enabled_eps:
                 self.api.disable_ep(self.enabled_eps[ep])
 
             self.enabled_eps={}
+            self.endpoint_recv_buffer={}
             #TODO: handle unconfiguration. By now not implemented in raw_gadget
             self.is_configured= False
 
@@ -318,14 +336,19 @@ class RawGadgetApp(FacedancerApp):
             for ep in interface.get_endpoints():
                 ep_handle = self.api.ep_enable(ep.get_descriptor())
                 self.enabled_eps[ep.get_address()] = ep_handle
-                print(f"ASSIGNED {self.eps_info[ep_handle]=} for {ep=}")
-        self.api.vbus_draw(cfg.max_power)
+                self.endpoint_recv_buffer[ep.get_address()]=[]
+                # print(f"ASSIGNED {self.eps_info[ep_handle]=} for {ep=}")
+        self.api.vbus_draw(cfg.max_power//2)
         self.api.configure()
         self.is_configured=True
 
-    def send_on_endpoint(self,ep_num,data,blocking):
+    def send_on_endpoint(self,ep_num,data,blocking=True):
 
-        print(f"send_on_endpoint {ep_num=} {len(data)=:0x}")
+        if isinstance(data,tuple):
+            data=bytes(data)
+        elif isinstance(data,list):
+            data=bytes(data)
+        # print(f"send_on_endpoint {ep_num=} {len(data)=:0x}")
         if ep_num == 0:
             if len(data)==0:
                 self.api.ep0_read(data)
@@ -335,8 +358,10 @@ class RawGadgetApp(FacedancerApp):
             ep_num|=0x80
             self.api.ep_write(self.enabled_eps[ep_num],data)
 
+    # def recv_on_enpoint(self,):
+
     def stall_endpoint(self,ep_num, direction):
-        print(f"stall_endpoint {ep_num=}")
+        # print(f"stall_endpoint {ep_num=}")
         self.api.ep_stall(ep_num)
 
     def set_address(self,address, defer):
@@ -349,13 +374,31 @@ class RawGadgetApp(FacedancerApp):
                        be set if we're changing the address before we ack
                        the relevant transaction.
         """
-        print(f"set_address {address=} {defer=}")
+        # print(f"set_address {address=} {defer=}")
         pass
 
     def reset(self):
         pass
 
+    def ack_status_stage(self, direction=0, endpoint_number=0, blocking=False):
+       logging.info(f"ack_status_stage {direction=} {endpoint_number} {blocking=}")
+       if direction==0 and endpoint_number==0:
+           self.send_on_endpoint(0,b'')
+       pass
 
+    def stall_ep0(self):
+        self.api.ep_stall(0)
+
+    def _get_endpoint(self,addr):
+        try:
+            from facedancer.future import USBDirection
+            return self.connected_device.get_endpoint(addr & 0x7f, USBDirection.from_endpoint_address(addr))
+        except AttributeError:
+            for i in self.connected_device.configuration.interfaces:
+                for ep in i.endpoints:
+                    if ep.get_address() == addr:
+                        return ep
+        return None
 
     def service_irqs(self):
         event = self.api.event_fetch()
@@ -364,14 +407,32 @@ class RawGadgetApp(FacedancerApp):
                 self.eps_info = self.api.eps_info()
 
             case 'ctrl':
+                # from facedancer..request import USBControlRequest
                 from facedancer.future.request import USBControlRequest
-                request = USBControlRequest.from_raw_bytes(event.data, device=self.connected_device)
+                # request = USBControlRequest.from_raw_bytes(event.data, device=self.connected_device)
+                request = self.connected_device.create_request(event.data)
                 self.connected_device.handle_request(request)
 
             case 'empty':
-        # if self.is_configured:
-                for ep in self.enabled_eps:
-                    from facedancer.future import USBDirection
-                    device_ep=self.connected_device.get_endpoint(ep&0x7f,USBDirection.from_endpoint_address(ep))
-                    # device_ep.handle_data_requested()
-                    self.connected_device.handle_data_requested(device_ep)
+                if self.is_configured:
+                    for ep in self.enabled_eps:
+                        from facedancer.future import USBDirection
+                        dir =USBDirection.from_endpoint_address(ep)
+                        device_ep=self._get_endpoint(ep)
+
+                        if dir == USBDirection.IN:
+                            try:
+                                self.connected_device.handle_data_requested(device_ep)
+                            except AttributeError:
+                                pass
+                        elif dir == USBDirection.OUT:
+                            # print(f"{self.enabled_eps[ep]=} {dir=}")
+                            ## fifo_status=self.api.fifo_status(self.enabled_eps[ep])
+                            ## print(f"{fifo_status=}")
+                            rv,data=self.api.ep_read_async(self.enabled_eps[ep],bytearray(device_ep.max_packet_size))
+                            # print(f"{device_ep=} {rv=}")
+                            if rv>0:
+                                try:
+                                    self.connected_device.handle_data_received(device_ep,data[8:8+rv])
+                                except AttributeError:
+                                    self.connected_device.handle_data_available(device_ep.get_address(),data[8:8+rv])

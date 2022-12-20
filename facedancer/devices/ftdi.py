@@ -54,11 +54,13 @@ class FTDIDevice(USBDevice):
                 number        : int          = OUT_ENDPOINT
                 direction     : USBDirection = USBDirection.OUT
                 transfer_type : USBTransferType = USBTransferType.BULK
+                max_packet_size      : int = 0x200
 
             class _InEndpoint(USBEndpoint):
                 number        : int          = IN_ENDPOINT
                 direction     : USBDirection = USBDirection.IN
                 transfer_type : USBTransferType = USBTransferType.BULK
+                max_packet_size      : int = 0x200
 
 
     def __post_init__(self):
